@@ -25,15 +25,19 @@ jobs:
 
       - name: Prepare variables
         id: prep
+        env:
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_KEEP_ALIVE: ${{ github.event.inputs.keep_alive }}
+          SECRET_KALI_PASS: ${{ secrets.KALI_RDP_PASSWORD }}
         run: |
           set -euo pipefail
-          MODE="${{ github.event.inputs.mode || 'host' }}"
-          KEEP_ALIVE="${{ github.event.inputs.keep_alive || 'true' }}"
+          MODE="${INPUT_MODE:-host}"
+          KEEP_ALIVE="${INPUT_KEEP_ALIVE:-true}"
           echo "MODE=${MODE}" >> $GITHUB_ENV
           echo "KEEP_ALIVE=${KEEP_ALIVE}" >> $GITHUB_ENV
           # Kali credentials: prefer secret KALI_RDP_PASSWORD if set, otherwise default to 'root' (insecure)
-          if [ -n "${{ secrets.KALI_RDP_PASSWORD || '' }}" ]; then
-            echo "KALI_RDP_PASSWORD=${{ secrets.KALI_RDP_PASSWORD }}" >> $GITHUB_ENV
+          if [ -n "${SECRET_KALI_PASS:-}" ]; then
+            echo "KALI_RDP_PASSWORD=${SECRET_KALI_PASS}" >> $GITHUB_ENV
           else
             echo "KALI_RDP_PASSWORD=root" >> $GITHUB_ENV
           fi
@@ -54,12 +58,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo cp /etc/xrdp/startwm.sh /etc/xrdp/startwm.sh.bak || true
-          cat <<'EOF' | sudo tee /etc/xrdp/startwm.sh >/dev/null
-#!/bin/sh
-unset DBUS_SESSION_BUS_ADDRESS
-unset XDG_RUNTIME_DIR
-exec startxfce4
-EOF
+          # avoid a here-doc (can sometimes upset YAML parsers); use printf -> sudo tee
+          printf '%s\n' '#!/bin/sh' 'unset DBUS_SESSION_BUS_ADDRESS' 'unset XDG_RUNTIME_DIR' 'exec startxfce4' | sudo tee /etc/xrdp/startwm.sh >/dev/null
           sudo chmod +x /etc/xrdp/startwm.sh
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp
@@ -203,7 +203,7 @@ EOF
       - name: Keep-alive or finish
         run: |
           set -euo pipefail
-          if [ "${KEEP_ALIVE}" != "true" ]; then
+          if [ "${KEEP_ALIVE:-true}" != "true" ]; then
             echo "KEEP_ALIVE is false — finishing job."
             exit 0
           fi
