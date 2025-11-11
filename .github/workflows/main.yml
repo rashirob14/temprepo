@@ -1,4 +1,4 @@
-name: RDP (Ubuntu)
+name: RDP (Ubuntu - XFCE + Tailscale)
 
 on:
   workflow_dispatch:
@@ -7,80 +7,83 @@ jobs:
   secure-rdp:
     runs-on: ubuntu-latest
     timeout-minutes: 3600
+    env:
+      # avoid printing this in logs; it's written to GITHUB_ENV later
+      RDP_USER: RDP
 
     steps:
-      - name: Checkout (needed for some runners)
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Update & install prerequisites
+      - name: Basic packages & update
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            xrdp policykit-1 wget curl gnupg2 ca-certificates \
-            ufw jq openssl
+            wget curl gnupg2 ca-certificates ubuntu-desktop-minimal \
+            xfce4 xfce4-goodies xrdp dbus-x11 policykit-1 \
+            net-tools lsb-release jq openssl procps
 
-      - name: Configure XRDP and core settings
+      - name: Configure XFCE for xrdp
         run: |
           set -euo pipefail
-          # Ensure xrdp service is enabled and restarted
+          # Ensure Xfce session is default for xrdp
+          # Backup existing startwm.sh
+          sudo cp /etc/xrdp/startwm.sh /etc/xrdp/startwm.sh.bak || true
+          # Replace startwm.sh to start xfce4-session
+          echo '#!/bin/sh' | sudo tee /etc/xrdp/startwm.sh >/dev/null
+          echo 'unset DBUS_SESSION_BUS_ADDRESS' | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
+          echo 'unset XDG_RUNTIME_DIR' | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
+          echo 'exec startxfce4' | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
+          sudo chmod +x /etc/xrdp/startwm.sh
+
+          # Enable and restart xrdp
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp
+          # Give xrdp a moment
+          sleep 2
+          sudo systemctl status xrdp --no-pager || true
 
-          # Allow xrdp user sessions in /etc/ssl/limits (Ubuntu default usually fine)
-          # Make sure a desktop session is available (depends on runner image).
-          # If desktop environment is missing, xrdp will still install but may not provide a GUI.
-
-          # Open firewall port 3389 (TCP) for testing - Tailscale will restrict access by default,
-          # but keep port open locally so xrdp can bind.
-          sudo ufw --force enable
-          sudo ufw allow 3389/tcp
-          sudo ufw reload
-
-      - name: Create RDP user with secure password
-        env:
-          GITHUB_ENV: ${{ github.env }}
+      - name: Create RDP user with secure password (saved to GITHUB_ENV only)
+        id: make_user
         run: |
           set -euo pipefail
-          # Generate a strong 16+ character password with high entropy
-          PASSWORD=$(openssl rand -base64 24)
-          USERNAME="RDP"
+          USERNAME="${RDP_USER:-RDP}"
 
-          # Create user if not exists (non-interactive)
+          # Generate a strong password (24 bytes base64 -> ~32 chars)
+          PASSWORD=$(openssl rand -base64 24)
+
+          # Create user if not exists
           if id "$USERNAME" >/dev/null 2>&1; then
-              echo "User $USERNAME already exists"
+            echo "User $USERNAME already exists"
+            # Optionally reset password
+            echo "$USERNAME:$PASSWORD" | sudo chpasswd
           else
-              sudo useradd -m -s /bin/bash "$USERNAME"
-              echo "$USERNAME:$PASSWORD" | sudo chpasswd
-              sudo usermod -aG sudo "$USERNAME"
+            sudo useradd -m -s /bin/bash "$USERNAME"
+            echo "$USERNAME:$PASSWORD" | sudo chpasswd
+            sudo usermod -aG sudo "$USERNAME"
           fi
 
-          # Ensure user has no password expiry
+          # Avoid expiration
           sudo chage -I -1 -m 0 -M 99999 -E -1 "$USERNAME"
 
-          # Add credentials to environment for later steps (GITHUB_ENV)
-          echo "RDP_CREDS=User: $USERNAME | Password: $PASSWORD" >> $GITHUB_ENV
-          echo "RDP_USER=$USERNAME" >> $GITHUB_ENV
-          echo "RDP_PASSWORD=$PASSWORD" >> $GITHUB_ENV
+          # Write credentials to GITHUB_ENV (this file is not echoed to logs by Actions)
+          echo "RDP_CREDS_USER=$USERNAME" >> $GITHUB_ENV
+          echo "RDP_CREDS_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
-          # Quick check
+          # Confirm creation silently (no password printed)
           if ! id "$USERNAME" >/dev/null 2>&1; then
-              echo "User creation failed" >&2
-              exit 1
+            echo "User creation failed" >&2
+            exit 1
           fi
 
-      - name: Install Tailscale (official repo)
+      - name: Install Tailscale (official installer - robust across distros)
         run: |
           set -euo pipefail
-          # Official Tailscale install for Debian/Ubuntu
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/focal.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/focal.tailscale.list | \
-            sed 's#deb https://pkgs.tailscale.com/stable/ubuntu focal main#deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu focal main#' \
-            | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-          sudo apt-get update
-          sudo apt-get install -y tailscale
+          # Official Tailscale installer auto-detects distro/codename
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
 
-      - name: Establish Tailscale connection
+      - name: Start Tailscale (use secret auth key)
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
@@ -89,76 +92,86 @@ jobs:
             echo "Missing TAILSCALE_AUTH_KEY secret" >&2
             exit 1
           fi
-
           HOSTNAME="gh-runner-${GITHUB_RUN_ID:-manual}"
-          # Bring up tailscale using auth key and set hostname
           sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="${HOSTNAME}" || {
             echo "tailscale up failed" >&2
             sudo tailscale status || true
             exit 1
           }
 
-          # Wait for IPv4 address to appear (retry)
+          # Wait for an IPv4 address
           TS_IP=""
-          for i in {1..12}; do
-            TS_IP=$(tailscale ip -4 || true)
+          for i in $(seq 1 12); do
+            TS_IP=$(tailscale ip -4 2>/dev/null || true)
             if [ -n "$TS_IP" ]; then break; fi
-            sleep 5
+            sleep 3
           done
 
           if [ -z "$TS_IP" ]; then
-            echo "Tailscale IP not assigned. Dumping status:" >&2
-            tailscale status || true
+            echo "Tailscale IP not assigned. Dumping status for debugging:" >&2
+            sudo tailscale status || true
             exit 1
           fi
 
-          # Export to environment for later steps
+          # Export to GITHUB_ENV for later steps (safe)
           echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
           echo "TAILSCALE_HOSTNAME=$HOSTNAME" >> $GITHUB_ENV
-          echo "tailscale IP: $TS_IP"
 
-      - name: Verify RDP / XRDP accessibility over Tailscale
+      - name: (Optional) Configure firewall to allow XRDP (port 3389)
         run: |
           set -euo pipefail
-          TS_IP=${{ env.TAILSCALE_IP }}
+          # Do not enable UFW if it may block needed services in your environment.
+          # This step ensures port 3389 is allowed locally.
+          if command -v ufw >/dev/null 2>&1; then
+            sudo ufw --force enable || true
+            sudo ufw allow 3389/tcp || true
+            sudo ufw reload || true
+          else
+            echo "ufw not present or not usable; ensure port 3389 is open where required."
+          fi
+
+      - name: Verify connectivity to XRDP on Tailscale IP
+        run: |
+          set -euo pipefail
+          TS_IP="${{ env.TAILSCALE_IP }}"
           if [ -z "$TS_IP" ]; then
             echo "No Tailscale IP found in env" >&2
             exit 1
           fi
-
-          echo "Testing TCP connectivity to $TS_IP:3389"
-          # Use netcat if available; otherwise install
+          echo "Checking TCP connectivity to $TS_IP:3389"
+          # Install netcat if missing
           if ! command -v nc >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y netcat
           fi
-
-          if ! nc -z -w 5 "$TS_IP" 3389; then
-            echo "TCP connection to RDP port 3389 failed (from runner)." >&2
-            echo "Check xrdp service and firewall settings."
+          if nc -z -w 5 "$TS_IP" 3389; then
+            echo "TCP connectivity to $TS_IP:3389 OK"
+          else
+            echo "TCP connection to RDP port 3389 failed" >&2
             sudo systemctl status xrdp --no-pager || true
+            sudo tailscale status || true
             exit 1
           fi
 
-          echo "TCP connectivity successful!"
-
-      - name: Print connection info (keeps secret in GITHUB_ENV)
+      - name: Print safe connection info (DOES NOT print password)
         run: |
           set -euo pipefail
-          echo "=== RDP ACCESS ==="
-          echo "Address: ${{ env.TAILSCALE_IP }}"
-          echo "Hostname: ${{ env.TAILSCALE_HOSTNAME }}"
-          echo "Username: ${{ env.RDP_USER }}"
-          # Do NOT print password to logs in plain text; the password is available in GITHUB_ENV if needed.
-          echo "Password stored in GITHUB_ACTIONS environment variable RDP_PASSWORD (GITHUB_ENV)."
-          echo "=================="
+          echo "=== RDP CONNECT INFO ==="
+          echo "Tailscale IP: ${{ env.TAILSCALE_IP }}"
+          echo "Tailscale Hostname: ${{ env.TAILSCALE_HOSTNAME }}"
+          echo "Username: ${{ env.RDP_CREDS_USER }}"
+          echo ""
+          echo "Password has been written to GITHUB Actions environment file (GITHUB_ENV)."
+          echo "To retrieve it: open the workflow run -> Actions -> click the run -> go to 'Variables' or use the runner to read from the environment."
+          echo ""
+          echo "IMPORTANT: Avoid leaking the password in public logs. The job does not print it here."
+          echo "========================"
 
-      - name: Maintain Connection (keep job alive)
+      - name: Maintain Connection (keep job alive; heartbeat)
         run: |
           set -euo pipefail
-          echo "Keeping workflow active. Press Ctrl+C to cancel workflow run."
-          # Print periodic heartbeat to logs so user can see it's alive
+          echo "Keeping workflow active. Stop run to terminate."
           while true; do
-            echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] RDP Active - sleeping 300s"
+            echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] RDP active - heartbeat (sleep 300s)"
             sleep 300
           done
