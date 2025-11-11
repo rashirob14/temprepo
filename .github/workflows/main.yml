@@ -27,20 +27,15 @@ jobs:
       - name: Configure XFCE for xrdp
         run: |
           set -euo pipefail
-          # Ensure Xfce session is default for xrdp
-          # Backup existing startwm.sh
           sudo cp /etc/xrdp/startwm.sh /etc/xrdp/startwm.sh.bak || true
-          # Replace startwm.sh to start xfce4-session
           echo '#!/bin/sh' | sudo tee /etc/xrdp/startwm.sh >/dev/null
           echo 'unset DBUS_SESSION_BUS_ADDRESS' | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
           echo 'unset XDG_RUNTIME_DIR' | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
           echo 'exec startxfce4' | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
           sudo chmod +x /etc/xrdp/startwm.sh
 
-          # Enable and restart xrdp
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp
-          # Give xrdp a moment
           sleep 2
           sudo systemctl status xrdp --no-pager || true
 
@@ -53,10 +48,8 @@ jobs:
           # Generate a strong password (24 bytes base64 -> ~32 chars)
           PASSWORD=$(openssl rand -base64 24)
 
-          # Create user if not exists
           if id "$USERNAME" >/dev/null 2>&1; then
             echo "User $USERNAME already exists"
-            # Optionally reset password
             echo "$USERNAME:$PASSWORD" | sudo chpasswd
           else
             sudo useradd -m -s /bin/bash "$USERNAME"
@@ -64,14 +57,12 @@ jobs:
             sudo usermod -aG sudo "$USERNAME"
           fi
 
-          # Avoid expiration
           sudo chage -I -1 -m 0 -M 99999 -E -1 "$USERNAME"
 
-          # Write credentials to GITHUB_ENV (this file is not echoed to logs by Actions)
+          # Write credentials to GITHUB_ENV (not echoed in logs)
           echo "RDP_CREDS_USER=$USERNAME" >> $GITHUB_ENV
           echo "RDP_CREDS_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
-          # Confirm creation silently (no password printed)
           if ! id "$USERNAME" >/dev/null 2>&1; then
             echo "User creation failed" >&2
             exit 1
@@ -80,18 +71,23 @@ jobs:
       - name: Install Tailscale (official installer - robust across distros)
         run: |
           set -euo pipefail
-          # Official Tailscale installer auto-detects distro/codename
           curl -fsSL https://tailscale.com/install.sh | sudo sh
 
-      - name: Start Tailscale (use secret auth key)
+      - name: Start Tailscale (use secret auth key if provided)
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           set -euo pipefail
+
+          # If TAILSCALE_AUTH_KEY is not provided, skip tailscale setup
           if [ -z "${TAILSCALE_AUTH_KEY:-}" ]; then
-            echo "Missing TAILSCALE_AUTH_KEY secret" >&2
-            exit 1
+            echo "WARNING: TAILSCALE_AUTH_KEY not provided; skipping Tailscale setup" >&2
+            echo "SKIP_TAILSCALE=1" >> $GITHUB_ENV
+            echo "TAILSCALE_IP=" >> $GITHUB_ENV
+            echo "TAILSCALE_HOSTNAME=" >> $GITHUB_ENV
+            exit 0
           fi
+
           HOSTNAME="gh-runner-${GITHUB_RUN_ID:-manual}"
           sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="${HOSTNAME}" || {
             echo "tailscale up failed" >&2
@@ -113,15 +109,13 @@ jobs:
             exit 1
           fi
 
-          # Export to GITHUB_ENV for later steps (safe)
           echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
           echo "TAILSCALE_HOSTNAME=$HOSTNAME" >> $GITHUB_ENV
+          echo "SKIP_TAILSCALE=0" >> $GITHUB_ENV
 
       - name: (Optional) Configure firewall to allow XRDP (port 3389)
         run: |
           set -euo pipefail
-          # Do not enable UFW if it may block needed services in your environment.
-          # This step ensures port 3389 is allowed locally.
           if command -v ufw >/dev/null 2>&1; then
             sudo ufw --force enable || true
             sudo ufw allow 3389/tcp || true
@@ -133,13 +127,17 @@ jobs:
       - name: Verify connectivity to XRDP on Tailscale IP
         run: |
           set -euo pipefail
-          TS_IP="${{ env.TAILSCALE_IP }}"
+          if [ "${SKIP_TAILSCALE:-0}" = "1" ]; then
+            echo "Skipping XRDP/Tailscale connectivity check because SKIP_TAILSCALE=1"
+            exit 0
+          fi
+
+          TS_IP="${TAILSCALE_IP:-}"
           if [ -z "$TS_IP" ]; then
             echo "No Tailscale IP found in env" >&2
             exit 1
           fi
           echo "Checking TCP connectivity to $TS_IP:3389"
-          # Install netcat if missing
           if ! command -v nc >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y netcat
@@ -157,14 +155,17 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== RDP CONNECT INFO ==="
-          echo "Tailscale IP: ${{ env.TAILSCALE_IP }}"
-          echo "Tailscale Hostname: ${{ env.TAILSCALE_HOSTNAME }}"
-          echo "Username: ${{ env.RDP_CREDS_USER }}"
+          if [ "${SKIP_TAILSCALE:-0}" = "1" ]; then
+            echo "Tailscale was not configured for this run."
+            echo "To enable, add the secret TAILSCALE_AUTH_KEY in: Settings -> Secrets and variables -> Actions"
+          else
+            echo "Tailscale IP: ${TAILSCALE_IP}"
+            echo "Tailscale Hostname: ${TAILSCALE_HOSTNAME}"
+          fi
+          echo "Username: ${RDP_CREDS_USER}"
           echo ""
           echo "Password has been written to GITHUB Actions environment file (GITHUB_ENV)."
-          echo "To retrieve it: open the workflow run -> Actions -> click the run -> go to 'Variables' or use the runner to read from the environment."
-          echo ""
-          echo "IMPORTANT: Avoid leaking the password in public logs. The job does not print it here."
+          echo "Avoid leaking the password in public logs."
           echo "========================"
 
       - name: Maintain Connection (keep job alive; heartbeat)
