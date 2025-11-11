@@ -18,6 +18,9 @@ jobs:
     timeout-minutes: 3600
     env:
       RDP_USER: RDP
+      KALI_RDP_USER: Kali
+      # prefer secret if provided; will be empty string if not set
+      KALI_RDP_PASSWORD: ${{ secrets.KALI_RDP_PASSWORD }}
 
     steps:
       - name: Checkout
@@ -35,10 +38,10 @@ jobs:
           KEEP_ALIVE="${INPUT_KEEP_ALIVE:-true}"
           echo "MODE=${MODE}" >> $GITHUB_ENV
           echo "KEEP_ALIVE=${KEEP_ALIVE}" >> $GITHUB_ENV
-          # Kali credentials: prefer secret KALI_RDP_PASSWORD if set, otherwise default to 'root' (insecure)
           if [ -n "${SECRET_KALI_PASS:-}" ]; then
             echo "KALI_RDP_PASSWORD=${SECRET_KALI_PASS}" >> $GITHUB_ENV
           else
+            # fallback (insecure) default if no secret provided
             echo "KALI_RDP_PASSWORD=root" >> $GITHUB_ENV
           fi
           echo "KALI_RDP_USER=Kali" >> $GITHUB_ENV
@@ -58,7 +61,6 @@ jobs:
         run: |
           set -euo pipefail
           sudo cp /etc/xrdp/startwm.sh /etc/xrdp/startwm.sh.bak || true
-          # avoid a here-doc (can sometimes upset YAML parsers); use printf -> sudo tee
           printf '%s\n' '#!/bin/sh' 'unset DBUS_SESSION_BUS_ADDRESS' 'unset XDG_RUNTIME_DIR' 'exec startxfce4' | sudo tee /etc/xrdp/startwm.sh >/dev/null
           sudo chmod +x /etc/xrdp/startwm.sh
           sudo systemctl enable xrdp
@@ -93,7 +95,6 @@ jobs:
         if: ${{ github.event.inputs.mode == 'kali' }}
         run: |
           set -euo pipefail
-          # GitHub-hosted runners normally have docker; verify
           if ! command -v docker >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y docker.io
@@ -107,17 +108,18 @@ jobs:
           CT_NAME="kali-rdp"
           docker rm -f "$CT_NAME" >/dev/null 2>&1 || true
           docker pull kalilinux/kali-rolling:latest
+          # run with host networking so xrdp will be reachable on the runner's network stack
           docker run -d --name "$CT_NAME" --network host --privileged --cap-add=NET_ADMIN \
             kalilinux/kali-rolling:latest sleep infinity
           docker exec -i "$CT_NAME" bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xfce4 xfce4-goodies xrdp sudo"
           docker exec -i "$CT_NAME" bash -lc "id -u ${KALI_RDP_USER} >/dev/null 2>&1 || useradd -m -s /bin/bash ${KALI_RDP_USER}"
-          printf '%s:%s\n' "${KALI_RDP_USER}" "${KALI_RDP_PASSWORD}" | docker exec -i "$CT_NAME" chpasswd
+          printf '%s:%s\n' "${KALI_RDP_USER}" "${KALI_RDP_PASSWORD:-root}" | docker exec -i "$CT_NAME" chpasswd
           docker exec -i "$CT_NAME" bash -lc "usermod -aG sudo ${KALI_RDP_USER} || true"
           docker exec -i "$CT_NAME" bash -lc "mkdir -p /home/${KALI_RDP_USER}/.xsession && echo 'startxfce4' > /home/${KALI_RDP_USER}/.xsession && chown ${KALI_RDP_USER}:${KALI_RDP_USER} /home/${KALI_RDP_USER}/.xsession"
           docker exec -i "$CT_NAME" bash -lc "nohup /usr/sbin/xrdp-sesman >/var/log/xrdp-sesman.log 2>&1 &"
           docker exec -i "$CT_NAME" bash -lc "nohup /usr/sbin/xrdp >/var/log/xrdp.log 2>&1 &"
           echo "RDP_CREDS_USER=${KALI_RDP_USER}" >> $GITHUB_ENV
-          echo "RDP_CREDS_PASSWORD=${KALI_RDP_PASSWORD}" >> $GITHUB_ENV
+          echo "RDP_CREDS_PASSWORD=${KALI_RDP_PASSWORD:-root}" >> $GITHUB_ENV
 
       - name: Install Tailscale (optional/common)
         run: |
