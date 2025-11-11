@@ -7,28 +7,18 @@ on:
         description: "Run mode: 'host' to configure the runner, 'kali' to start a Kali container with XFCE+xrdp"
         required: false
         default: "host"
-        type: choice
-        options:
-          - host
-          - kali
       keep_alive:
-        description: "Keep the runner alive after setup (true/false)"
+        description: "Keep the runner alive after setup ('true'/'false')"
         required: false
         default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
-
-env:
-  # default username for host-mode; for Kali container the user is controlled below
-  RDP_USER: RDP
 
 jobs:
   setup-rdp:
     runs-on: ubuntu-latest
     timeout-minutes: 3600
-    environment: production
+    env:
+      RDP_USER: RDP
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,10 +28,10 @@ jobs:
         run: |
           set -euo pipefail
           MODE="${{ github.event.inputs.mode || 'host' }}"
-          echo "MODE=${MODE}" >> $GITHUB_ENV
           KEEP_ALIVE="${{ github.event.inputs.keep_alive || 'true' }}"
+          echo "MODE=${MODE}" >> $GITHUB_ENV
           echo "KEEP_ALIVE=${KEEP_ALIVE}" >> $GITHUB_ENV
-          # Default Kali credentials (insecure) — override by setting secret KALI_RDP_PASSWORD
+          # Kali credentials: prefer secret KALI_RDP_PASSWORD if set, otherwise default to 'root' (insecure)
           if [ -n "${{ secrets.KALI_RDP_PASSWORD || '' }}" ]; then
             echo "KALI_RDP_PASSWORD=${{ secrets.KALI_RDP_PASSWORD }}" >> $GITHUB_ENV
           else
@@ -50,7 +40,7 @@ jobs:
           echo "KALI_RDP_USER=Kali" >> $GITHUB_ENV
 
       - name: Install common packages (host)
-        if: env.MODE == 'host'
+        if: ${{ github.event.inputs.mode == 'host' }}
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -60,14 +50,16 @@ jobs:
             net-tools lsb-release jq openssl procps
 
       - name: Configure XFCE for xrdp (host)
-        if: env.MODE == 'host'
+        if: ${{ github.event.inputs.mode == 'host' }}
         run: |
           set -euo pipefail
           sudo cp /etc/xrdp/startwm.sh /etc/xrdp/startwm.sh.bak || true
-          echo '#!/bin/sh' | sudo tee /etc/xrdp/startwm.sh >/dev/null
-          echo 'unset DBUS_SESSION_BUS_ADDRESS' | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
-          echo 'unset XDG_RUNTIME_DIR' | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
-          echo 'exec startxfce4' | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
+          cat <<'EOF' | sudo tee /etc/xrdp/startwm.sh >/dev/null
+#!/bin/sh
+unset DBUS_SESSION_BUS_ADDRESS
+unset XDG_RUNTIME_DIR
+exec startxfce4
+EOF
           sudo chmod +x /etc/xrdp/startwm.sh
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp
@@ -75,7 +67,7 @@ jobs:
           sudo systemctl status xrdp --no-pager || true
 
       - name: Create RDP user (host)
-        if: env.MODE == 'host'
+        if: ${{ github.event.inputs.mode == 'host' }}
         id: make_user
         run: |
           set -euo pipefail
@@ -97,38 +89,37 @@ jobs:
             exit 1
           fi
 
-      - name: Install Docker (for Kali container mode)
-        if: env.MODE == 'kali'
+      - name: Ensure Docker available (kali)
+        if: ${{ github.event.inputs.mode == 'kali' }}
         run: |
           set -euo pipefail
-          # GitHub hosted runners already have Docker; verify
-          docker --version || (sudo apt-get update && sudo apt-get install -y docker.io && docker --version)
+          # GitHub-hosted runners normally have docker; verify
+          if ! command -v docker >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y docker.io
+          fi
+          docker --version
 
       - name: Start Kali container with XFCE + xrdp (kali)
-        if: env.MODE == 'kali'
+        if: ${{ github.event.inputs.mode == 'kali' }}
         run: |
           set -euo pipefail
           CT_NAME="kali-rdp"
           docker rm -f "$CT_NAME" >/dev/null 2>&1 || true
           docker pull kalilinux/kali-rolling:latest
-          # Run container with host networking so xrdp will be reachable on the runner host IP
           docker run -d --name "$CT_NAME" --network host --privileged --cap-add=NET_ADMIN \
             kalilinux/kali-rolling:latest sleep infinity
-          # Install XFCE and xrdp inside the container
           docker exec -i "$CT_NAME" bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xfce4 xfce4-goodies xrdp sudo"
-          # Create user and set password (KALI_RDP_USER / KALI_RDP_PASSWORD)
           docker exec -i "$CT_NAME" bash -lc "id -u ${KALI_RDP_USER} >/dev/null 2>&1 || useradd -m -s /bin/bash ${KALI_RDP_USER}"
           printf '%s:%s\n' "${KALI_RDP_USER}" "${KALI_RDP_PASSWORD}" | docker exec -i "$CT_NAME" chpasswd
           docker exec -i "$CT_NAME" bash -lc "usermod -aG sudo ${KALI_RDP_USER} || true"
           docker exec -i "$CT_NAME" bash -lc "mkdir -p /home/${KALI_RDP_USER}/.xsession && echo 'startxfce4' > /home/${KALI_RDP_USER}/.xsession && chown ${KALI_RDP_USER}:${KALI_RDP_USER} /home/${KALI_RDP_USER}/.xsession"
-          # Start xrdp processes (systemd not guaranteed)
           docker exec -i "$CT_NAME" bash -lc "nohup /usr/sbin/xrdp-sesman >/var/log/xrdp-sesman.log 2>&1 &"
           docker exec -i "$CT_NAME" bash -lc "nohup /usr/sbin/xrdp >/var/log/xrdp.log 2>&1 &"
-          # Persist credentials to GITHUB_ENV
           echo "RDP_CREDS_USER=${KALI_RDP_USER}" >> $GITHUB_ENV
           echo "RDP_CREDS_PASSWORD=${KALI_RDP_PASSWORD}" >> $GITHUB_ENV
 
-      - name: Install Tailscale (common)
+      - name: Install Tailscale (optional/common)
         run: |
           set -euo pipefail
           curl -fsSL https://tailscale.com/install.sh | sudo sh
@@ -138,7 +129,6 @@ jobs:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           set -euo pipefail
-          # Treat the auth key as optional. If missing, skip tailscale setup.
           if [ -z "${TAILSCALE_AUTH_KEY:-}" ]; then
             echo "WARNING: TAILSCALE_AUTH_KEY not provided; skipping Tailscale setup" >&2
             echo "SKIP_TAILSCALE=1" >> $GITHUB_ENV
@@ -147,11 +137,7 @@ jobs:
             exit 0
           fi
           HOSTNAME="gh-runner-${GITHUB_RUN_ID:-manual}"
-          sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="${HOSTNAME}" || {
-            echo "tailscale up failed" >&2
-            sudo tailscale status || true
-            exit 1
-          }
+          sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="${HOSTNAME}" || { echo "tailscale up failed" >&2; sudo tailscale status || true; exit 1; }
           TS_IP=""
           for i in $(seq 1 12); do
             TS_IP=$(tailscale ip -4 2>/dev/null || true)
@@ -159,7 +145,7 @@ jobs:
             sleep 3
           done
           if [ -z "$TS_IP" ]; then
-            echo "Tailscale IP not assigned. Dumping status for debugging:" >&2
+            echo "Tailscale IP not assigned. Dumping status:" >&2
             sudo tailscale status || true
             exit 1
           fi
@@ -168,7 +154,7 @@ jobs:
           echo "SKIP_TAILSCALE=0" >> $GITHUB_ENV
 
       - name: Optional: allow XRDP port on firewall (host)
-        if: env.MODE == 'host'
+        if: ${{ github.event.inputs.mode == 'host' }}
         run: |
           set -euo pipefail
           if command -v ufw >/dev/null 2>&1; then
@@ -179,7 +165,7 @@ jobs:
             echo "ufw not present; ensure port 3389 is reachable where required."
           fi
 
-      - name: Debug: show network listeners and tailscale status
+      - name: Debug: show listeners and tailscale status
         run: |
           set -euo pipefail
           echo "--- xrdp listener (ss) ---"
@@ -201,7 +187,7 @@ jobs:
           echo "=== RDP CONNECT INFO ==="
           if [ "${SKIP_TAILSCALE:-0}" = "1" ]; then
             echo "Tailscale was not configured for this run."
-            echo "To enable Tailscale, add secret: TAILSCALE_AUTH_KEY and re-run."
+            echo "To enable: add secret TAILSCALE_AUTH_KEY in repo Settings -> Secrets and re-run."
           else
             echo "Tailscale IP: ${TAILSCALE_IP:-<not-set>}"
             echo "Tailscale Hostname: ${TAILSCALE_HOSTNAME:-<not-set>}"
@@ -211,9 +197,7 @@ jobs:
           echo ""
           echo "Username: ${RDP_CREDS_USER:-${KALI_RDP_USER}}"
           echo "Password: stored in GITHUB Actions environment file (GITHUB_ENV) for this run."
-          echo ""
-          echo "If SKIP_TAILSCALE=1 and you are using 'kali' mode on GitHub hosted runners, the container is using host network and is NOT reachable publicly."
-          echo "To connect from your machine, either run on a self-hosted runner with a reachable IP or enable Tailscale using the repo secret."
+          echo "If SKIP_TAILSCALE=1 and you used 'kali' mode on GitHub-hosted runners, the container uses --network host and is NOT publicly reachable."
           echo "========================"
 
       - name: Keep-alive or finish
@@ -225,6 +209,6 @@ jobs:
           fi
           echo "Keeping workflow active. Stop run to terminate."
           while true; do
-            echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] heartbeat (sleep 300s)"
+            echo "[$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")] heartbeat (sleep 300s)"
             sleep 300
           done
